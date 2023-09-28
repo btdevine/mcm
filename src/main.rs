@@ -1,37 +1,46 @@
 use dotenv::dotenv;
+use geo_types::Point;
+use gpx::{Gpx, Track, TrackSegment, Waypoint};
+use serde::{Deserialize, Serialize};
+use std::io::BufWriter;
+use std::{collections::HashMap, fs::File, io::Write, process::Command, time::Duration};
 use tempfile::NamedTempFile;
-use std::{
-    fs::File,
-    io::Write,
-    process::{Command, Stdio},
-    time::Duration,
-};
 use tokio::time::sleep;
 
-fn write_to_gpx(coords: Vec<(f64, f64)>) -> Result<(), Box<dyn std::error::Error>> {
-    let file_name = "Marine Corps Marathon Route";
-    let mut file = File::create("mcm.gpx").expect("Unable to create file");
+fn write_to_gpx(unique_coords: HashMap<i64, Vec<f64>>) -> Result<(), Box<dyn std::error::Error>> {
+    // Sort keys to iterate in order
+    let mut sorted_keys: Vec<_> = unique_coords.keys().collect();
+    sorted_keys.sort();
 
-    writeln!(
-        file,
-        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-            <gpx version="1.1" creator="https://onthegomap.com" xmlns="http://www.topografix.com/GPX/1/1">
-              <metadata>
-                <name>{}</name>
-              </metadata>
-              <rte>
-                <name>0.84 mi route</name>"#,
-        file_name
-    )?;
+    let mut track_segments: Vec<TrackSegment> = Vec::new();
 
-    // Write each coordinate to the file
-    for (lat, lng) in coords.iter() {
-        writeln!(file, r#"    <rtept lat="{}" lon="{}"/>"#, lat, lng)
-            .expect("Unable to write data");
+    for key in sorted_keys {
+        let coords = unique_coords.get(key).unwrap();
+
+        let mut waypoints = Vec::new();
+        for i in (0..coords.len()).step_by(2) {
+            let waypoint = Waypoint::new(Point::new(coords[i + 1], coords[i]));
+            waypoints.push(waypoint);
+        }
+
+        track_segments.push(TrackSegment { points: waypoints });
     }
 
-    // Close the rte and gpx tags
-    writeln!(file, "  </rte>\n</gpx>").expect("Unable to write data");
+    let track = Track {
+        segments: track_segments,
+        ..Default::default()
+    };
+
+    let gpx = Gpx {
+        tracks: vec![track],
+        version: gpx::GpxVersion::Gpx11,
+        ..Default::default()
+    };
+
+    // Write the GPX structure to a file
+    let file = File::create("output.gpx").unwrap();
+    let writer = BufWriter::new(file);
+    gpx::write(&gpx, writer).expect("Failed to write GPX file");
 
     Ok(())
 }
@@ -39,6 +48,140 @@ fn write_to_gpx(coords: Vec<(f64, f64)>) -> Result<(), Box<dyn std::error::Error
 struct Tile {
     x: i32,
     y: i32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GeoData {
+    #[serde(rename = "type")]
+    data_type: String,
+    properties: DataProperties,
+    features: Vec<FeatureCollection>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FeatureCollection {
+    #[serde(rename = "type")]
+    collection_type: String,
+    properties: CollectionProperties,
+    features: Vec<GeoFeature>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GeoFeature {
+    #[serde(rename = "type")]
+    feature_type: FeatureType,
+    id: i64,
+    properties: FeatureProperties,
+    geometry: Geometry,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum FeatureType {
+    Feature,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Geometry {
+    #[serde(rename = "type")]
+    geometry_type: GeometryType,
+    coordinates: GeometryCoordinate,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GeometryCoordinate {
+    Single(f64),
+    Array(Vec<CoordinateValue>),
+    DoubleArray(Vec<Vec<CoordinateValue>>),
+    TripleArray(Vec<Vec<Vec<CoordinateValue>>>),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CoordinateValue {
+    Single(f64),
+    Array(Vec<f64>),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum GeometryType {
+    LineString,
+    MultiPolygon,
+    Polygon,
+    MultiPoint,
+    Point,
+    MultiLineString,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub struct FeatureProperties {
+    class: Option<String>,
+    #[serde(rename = "ele")]
+    elevation: Option<i64>,
+    index: Option<i64>,
+    altitude_mode: Option<String>,
+    begin: Option<String>,
+    descriptio: Option<String>,
+    end: Option<String>,
+    name: Option<String>,
+    timestamp: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CollectionProperties {
+    layer: String,
+    version: i64,
+    extent: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DataProperties {
+    zoom: i64,
+    x: i64,
+    y: i64,
+    compressed: Option<bool>,
+}
+
+impl GeometryCoordinate {
+    pub fn flatten(&self) -> Vec<f64> {
+        match self {
+            GeometryCoordinate::Single(val) => vec![*val],
+            GeometryCoordinate::Array(arr) => arr.iter().flat_map(|v| v.flatten()).collect(),
+            GeometryCoordinate::DoubleArray(arr) => arr
+                .iter()
+                .flat_map(|inner_arr| {
+                    inner_arr
+                        .iter()
+                        .flat_map(|v| v.flatten())
+                        .collect::<Vec<f64>>()
+                })
+                .collect(),
+            GeometryCoordinate::TripleArray(arr) => arr
+                .iter()
+                .flat_map(|inner_arr| {
+                    inner_arr
+                        .iter()
+                        .flat_map(|second_arr| {
+                            second_arr
+                                .iter()
+                                .flat_map(|v| v.flatten())
+                                .collect::<Vec<f64>>()
+                        })
+                        .collect::<Vec<f64>>()
+                })
+                .collect(),
+        }
+    }
+}
+
+impl CoordinateValue {
+    pub fn flatten(&self) -> Vec<f64> {
+        match self {
+            CoordinateValue::Single(val) => vec![*val],
+            CoordinateValue::Array(arr) => arr.clone(),
+        }
+    }
 }
 
 #[tokio::main]
@@ -49,9 +192,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // For further reading, see https://www.maptiler.com/google-maps-coordinates-tile-bounds-projection/#3/15.00/50.00
     // for how to calculate the tile coordinates. These were just visually
     // obtained from scrolling around and seeing the network requests.
-    let top_left_tile = Tile { x: 25062, y: 18730 };
-    let bottom_right_tile = Tile { x: 25080, y: 18751 };
-    let z = 16;
+    let top_left_tile = Tile { x: 12531, y: 9365 };
+    let bottom_right_tile = Tile { x: 12540, y: 9376 };
+    let z = 15;
+
+    let total_tile_count =
+        (bottom_right_tile.x - top_left_tile.x) * (bottom_right_tile.y - top_left_tile.y);
+
+    let mut processed_tile_count = 0;
+
+    const NOTIFY_EVERY_PERCENT: u8 = 10;
+
+    let mut unique_coords: HashMap<i64, Vec<f64>> = HashMap::new();
 
     for x in top_left_tile.x..bottom_right_tile.x {
         for y in top_left_tile.y..bottom_right_tile.y {
@@ -69,7 +221,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Create a temporary file
             let mut temp_file = NamedTempFile::new()?;
             temp_file.write_all(&response)?;
-            
+
+            // Requires tippecanoe-decode to be installed (e.g with `brew install tippecanoe`)
             let output = Command::new("tippecanoe-decode")
                 .arg(temp_file.path().to_str().unwrap())
                 .arg(z.to_string())
@@ -79,25 +232,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .expect("Failed to run tippecanoe-decode");
 
             let geojson_data = String::from_utf8_lossy(&output.stdout);
-            println!("the response is: {:?}", geojson_data);
 
-            // let response: OnTheGoResponse =
-            //     reqwest::get(&url).await?.json::<OnTheGoResponse>().await?;
+            let geo_data: GeoData =
+                serde_json::from_str(&geojson_data).expect("Failed to parse data");
 
-            // // Extract the shape value for the leg (if exists)
-            // if let Some(leg) = response.legs.get(0) {
-            //     let encoded = &leg.shape;
-            //     // Decode the shape value and accumulate
-            //     all_decoded_coords.extend(decode(encoded));
-            // }
+            for feature_collection in &geo_data.features {
+                if feature_collection.properties.layer != "mcm-2018-marathon-v1-31s1ih" {
+                    continue;
+                }
+                for feature in &feature_collection.features {
+                    let flattened_coords = feature.geometry.coordinates.flatten();
+                    unique_coords.insert(feature.id, flattened_coords);
+                }
+            }
+
+            processed_tile_count += 1;
+            let divisor = total_tile_count / NOTIFY_EVERY_PERCENT as i32;
+            if processed_tile_count % (divisor) == 0 {
+                println!(
+                    "Processed {}% of the features.",
+                    10 * (processed_tile_count / divisor)
+                );
+            }
 
             // Rate limiting
-            sleep(Duration::from_secs(1)).await;
+            sleep(Duration::from_millis(100)).await;
         }
     }
+    println!("the unique coords are {:?}", unique_coords);
 
     // Write all the accumulated decoded coordinates to GPX
-    // write_to_gpx(all_decoded_coords)?;
+    write_to_gpx(unique_coords)?;
+
+    println!("Done!");
 
     Ok(())
 }
