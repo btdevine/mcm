@@ -1,33 +1,26 @@
 use dotenv::dotenv;
 use geo_types::Point;
-use gpx::{Gpx, Track, TrackSegment, Waypoint};
+use gpx::{write, Gpx, Track, TrackSegment, Waypoint};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io::BufWriter;
-use std::{collections::HashMap, fs::File, io::Write, process::Command, time::Duration};
+use std::{fs::File, io::Write, process::Command, time::Duration};
 use tempfile::NamedTempFile;
 use tokio::time::sleep;
 
-fn write_to_gpx(unique_coords: HashMap<i64, Vec<f64>>) -> Result<(), Box<dyn std::error::Error>> {
-    // Sort keys to iterate in order
-    let mut sorted_keys: Vec<_> = unique_coords.keys().collect();
-    sorted_keys.sort();
+fn write_to_gpx(unique_coords: BTreeMap<i64, Vec<f64>>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut waypoints = Vec::new();
 
-    let mut track_segments: Vec<TrackSegment> = Vec::new();
-
-    for key in sorted_keys {
-        let coords = unique_coords.get(key).unwrap();
-
-        let mut waypoints = Vec::new();
-        for i in (0..coords.len()).step_by(2) {
-            let waypoint = Waypoint::new(Point::new(coords[i + 1], coords[i]));
+    for (_, coord) in unique_coords {
+        for i in (0..coord.len()).step_by(2) {
+            let waypoint = Waypoint::new(Point::new(coord[i], coord[i + 1]));
             waypoints.push(waypoint);
         }
-
-        track_segments.push(TrackSegment { points: waypoints });
     }
 
+    let track_segment = TrackSegment { points: waypoints };
     let track = Track {
-        segments: track_segments,
+        segments: vec![track_segment],
         ..Default::default()
     };
 
@@ -38,9 +31,9 @@ fn write_to_gpx(unique_coords: HashMap<i64, Vec<f64>>) -> Result<(), Box<dyn std
     };
 
     // Write the GPX structure to a file
-    let file = File::create("output.gpx").unwrap();
+    let file = File::create("output.gpx")?;
     let writer = BufWriter::new(file);
-    gpx::write(&gpx, writer).expect("Failed to write GPX file");
+    write(&gpx, writer)?;
 
     Ok(())
 }
@@ -197,16 +190,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let z = 15;
 
     let total_tile_count =
-        (bottom_right_tile.x - top_left_tile.x) * (bottom_right_tile.y - top_left_tile.y);
+        (bottom_right_tile.x - top_left_tile.x + 1) * (bottom_right_tile.y - top_left_tile.y + 1);
 
     let mut processed_tile_count = 0;
 
     const NOTIFY_EVERY_PERCENT: u8 = 10;
 
-    let mut unique_coords: HashMap<i64, Vec<f64>> = HashMap::new();
+    let mut unique_coords: BTreeMap<i64, Vec<f64>> = BTreeMap::new();
 
-    for x in top_left_tile.x..bottom_right_tile.x {
-        for y in top_left_tile.y..bottom_right_tile.y {
+    for x in top_left_tile.x..=bottom_right_tile.x {
+        for y in top_left_tile.y..=bottom_right_tile.y {
             let url = format!(
                 "https://api.mapbox.com/v4/mapbox.mapbox-terrain-v2,mapbox.\
                 mapbox-streets-v7,geocentric.24kvp202,geocentric.0rz5vmpj,\
@@ -240,9 +233,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if feature_collection.properties.layer != "mcm-2018-marathon-v1-31s1ih" {
                     continue;
                 }
+                println!("mcm data found for tile {}, {}", x, y);
                 for feature in &feature_collection.features {
                     let flattened_coords = feature.geometry.coordinates.flatten();
-                    unique_coords.insert(feature.id, flattened_coords);
+                    if let Some(existing_coords) = unique_coords.get_mut(&feature.id) {
+                        // Add the new coordinates that don't already exist in `existing_coords`
+                        for i in (0..flattened_coords.len()).step_by(2) {
+                            let new_coord = (flattened_coords[i], flattened_coords[i + 1]);
+                            if !existing_coords
+                                .windows(2)
+                                .any(|window| window == [new_coord.0, new_coord.1])
+                            {
+                                existing_coords.push(new_coord.0);
+                                existing_coords.push(new_coord.1);
+                            }
+                        }
+                    } else {
+                        // The feature.id doesn't exist, so we insert it normally
+                        unique_coords.insert(feature.id, flattened_coords);
+                    }
                 }
             }
 
@@ -259,7 +268,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             sleep(Duration::from_millis(100)).await;
         }
     }
-    println!("the unique coords are {:?}", unique_coords);
 
     // Write all the accumulated decoded coordinates to GPX
     write_to_gpx(unique_coords)?;
