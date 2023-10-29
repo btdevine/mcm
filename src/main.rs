@@ -1,278 +1,175 @@
-use dotenv::dotenv;
+use std::{fs::File, io::BufWriter};
+
 use geo_types::Point;
 use gpx::{write, Gpx, Track, TrackSegment, Waypoint};
+use proj::Proj;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::io::BufWriter;
-use std::{fs::File, io::Write, process::Command, time::Duration};
-use tempfile::NamedTempFile;
-use tokio::time::sleep;
 
-fn write_to_gpx(unique_coords: BTreeMap<i64, Vec<f64>>) -> Result<(), Box<dyn std::error::Error>> {
-    let mut waypoints = Vec::new();
-
-    for (_, coord) in unique_coords {
-        for i in (0..coord.len()).step_by(2) {
-            let waypoint = Waypoint::new(Point::new(coord[i], coord[i + 1]));
-            waypoints.push(waypoint);
-        }
-    }
-
-    let track_segment = TrackSegment { points: waypoints };
-    let track = Track {
-        segments: vec![track_segment],
-        ..Default::default()
-    };
-
-    let gpx = Gpx {
-        tracks: vec![track],
-        version: gpx::GpxVersion::Gpx11,
-        ..Default::default()
-    };
-
-    // Write the GPX structure to a file
-    let file = File::create("output.gpx")?;
-    let writer = BufWriter::new(file);
-    write(&gpx, writer)?;
-
-    Ok(())
+// This was generated with https://app.quicktype.io/
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MarineDataLayers {
+    object_id_field_name: String,
+    unique_id_field: UniqueIdField,
+    global_id_field_name: String,
+    geometry_properties: GeometryProperties,
+    geometry_type: String,
+    spatial_reference: SpatialReference,
+    fields: Vec<Field>,
+    features: Vec<Feature>,
 }
 
-struct Tile {
-    x: i32,
-    y: i32,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct GeoData {
-    #[serde(rename = "type")]
-    data_type: String,
-    properties: DataProperties,
-    features: Vec<FeatureCollection>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct FeatureCollection {
-    #[serde(rename = "type")]
-    collection_type: String,
-    properties: CollectionProperties,
-    features: Vec<GeoFeature>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct GeoFeature {
-    #[serde(rename = "type")]
-    feature_type: FeatureType,
-    id: i64,
-    properties: FeatureProperties,
+#[derive(Serialize, Deserialize)]
+struct Feature {
+    attributes: Attributes,
     geometry: Geometry,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub enum FeatureType {
-    Feature,
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct Attributes {
+    #[serde(rename = "OBJECTID")]
+    objectid: i64,
+    course: String,
+    #[serde(rename = "Shape__Length")]
+    shape_length: f64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Geometry {
+#[derive(Serialize, Deserialize)]
+struct Geometry {
+    paths: Vec<Vec<[f64; 2]>>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Field {
+    name: String,
     #[serde(rename = "type")]
-    geometry_type: GeometryType,
-    coordinates: GeometryCoordinate,
+    field_type: String,
+    alias: String,
+    sql_type: String,
+    domain: Option<serde_json::Value>,
+    default_value: Option<serde_json::Value>,
+    length: Option<i64>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum GeometryCoordinate {
-    Single(f64),
-    Array(Vec<CoordinateValue>),
-    DoubleArray(Vec<Vec<CoordinateValue>>),
-    TripleArray(Vec<Vec<Vec<CoordinateValue>>>),
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeometryProperties {
+    shape_length_field_name: String,
+    units: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum CoordinateValue {
-    Single(f64),
-    Array(Vec<f64>),
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SpatialReference {
+    wkid: i64,
+    latest_wkid: i64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub enum GeometryType {
-    LineString,
-    MultiPolygon,
-    Polygon,
-    MultiPoint,
-    Point,
-    MultiLineString,
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UniqueIdField {
+    name: String,
+    is_system_maintained: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub struct FeatureProperties {
-    class: Option<String>,
-    #[serde(rename = "ele")]
-    elevation: Option<i64>,
-    index: Option<i64>,
-    altitude_mode: Option<String>,
-    begin: Option<String>,
-    descriptio: Option<String>,
-    end: Option<String>,
-    name: Option<String>,
-    timestamp: Option<String>,
-}
+fn write_segment(
+    converter: &Proj,
+    segment: Vec<[f64; 2]>,
+    reversed: bool,
+) -> Result<Vec<Waypoint>, Box<dyn std::error::Error>> {
+    let segment = if reversed {
+        segment.into_iter().rev().collect()
+    } else {
+        segment
+    };
+    let mut track_points: Vec<Waypoint> = Vec::with_capacity(segment.len());
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CollectionProperties {
-    layer: String,
-    version: i64,
-    extent: i64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DataProperties {
-    zoom: i64,
-    x: i64,
-    y: i64,
-    compressed: Option<bool>,
-}
-
-impl GeometryCoordinate {
-    pub fn flatten(&self) -> Vec<f64> {
-        match self {
-            GeometryCoordinate::Single(val) => vec![*val],
-            GeometryCoordinate::Array(arr) => arr.iter().flat_map(|v| v.flatten()).collect(),
-            GeometryCoordinate::DoubleArray(arr) => arr
-                .iter()
-                .flat_map(|inner_arr| {
-                    inner_arr
-                        .iter()
-                        .flat_map(|v| v.flatten())
-                        .collect::<Vec<f64>>()
-                })
-                .collect(),
-            GeometryCoordinate::TripleArray(arr) => arr
-                .iter()
-                .flat_map(|inner_arr| {
-                    inner_arr
-                        .iter()
-                        .flat_map(|second_arr| {
-                            second_arr
-                                .iter()
-                                .flat_map(|v| v.flatten())
-                                .collect::<Vec<f64>>()
-                        })
-                        .collect::<Vec<f64>>()
-                })
-                .collect(),
-        }
+    for point in segment {
+        let (lng, lat) = converter.convert((point[0], point[1]))?;
+        // Create a track point with the converted coordinates
+        let track_point = Waypoint::new(Point::new(lng, lat));
+        track_points.push(track_point);
     }
-}
 
-impl CoordinateValue {
-    pub fn flatten(&self) -> Vec<f64> {
-        match self {
-            CoordinateValue::Single(val) => vec![*val],
-            CoordinateValue::Array(arr) => arr.clone(),
-        }
-    }
+    Ok(track_points)
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dotenv().ok();
-    let mapbox_access_token =
-        std::env::var("MAPBOX_ACCESS_TOKEN").expect("MAPBOX_ACCESS_TOKEN not set");
-    // For further reading, see https://www.maptiler.com/google-maps-coordinates-tile-bounds-projection/#3/15.00/50.00
-    // for how to calculate the tile coordinates. These were just visually
-    // obtained from scrolling around and seeing the network requests.
-    let top_left_tile = Tile { x: 12531, y: 9365 };
-    let bottom_right_tile = Tile { x: 12540, y: 9376 };
-    let z = 15;
+    let url = "https://services3.arcgis.com/uriB49wQuOhO1ZVZ/arcgis/rest/\
+               services/Marine_Corps_Marathon_Map_WFL1/FeatureServer/4/query?\
+               where=1%3D1&outFields=*&f=json";
 
-    let total_tile_count =
-        (bottom_right_tile.x - top_left_tile.x + 1) * (bottom_right_tile.y - top_left_tile.y + 1);
+    let response: MarineDataLayers = reqwest::get(url).await?.json().await?;
 
-    let mut processed_tile_count = 0;
+    // Initialize a GPX object
+    let mut gpx = Gpx {
+        version: gpx::GpxVersion::Gpx11, // Setting the version to 1.1
+        ..Default::default()
+    };
 
-    const NOTIFY_EVERY_PERCENT: u8 = 10;
+    // Convert from Web Mercator to WGS84
+    let from = "EPSG:3857";
+    let to = "EPSG:4326";
+    let converter = Proj::new_known_crs(from, to, None)?;
 
-    let mut unique_coords: BTreeMap<i64, Vec<f64>> = BTreeMap::new();
+    let mut track = Track::default();
+    let mut track_segment = TrackSegment::default();
+    for feature in response.features {
+        if feature.attributes.course == "MCM" {
+            let paths = feature.geometry.paths;
 
-    for x in top_left_tile.x..=bottom_right_tile.x {
-        for y in top_left_tile.y..=bottom_right_tile.y {
-            let url = format!(
-                "https://api.mapbox.com/v4/mapbox.mapbox-terrain-v2,mapbox.\
-                mapbox-streets-v7,geocentric.24kvp202,geocentric.0rz5vmpj,\
-                geocentric.1tryr4je/{z}/{y}/{x}.vector.pbf?sku=101U7kfJrad7a\
-                &access_token={mapbox_access_token}",
-            );
-
-            let response = reqwest::get(&url).await?.bytes().await?;
-
-            // The data is returned as a protobuf (.pbf), so we need to decode it
-
-            // Create a temporary file
-            let mut temp_file = NamedTempFile::new()?;
-            temp_file.write_all(&response)?;
-
-            // Requires tippecanoe-decode to be installed (e.g with `brew install tippecanoe`)
-            let output = Command::new("tippecanoe-decode")
-                .arg(temp_file.path().to_str().unwrap())
-                .arg(z.to_string())
-                .arg(y.to_string())
-                .arg(x.to_string())
-                .output()
-                .expect("Failed to run tippecanoe-decode");
-
-            let geojson_data = String::from_utf8_lossy(&output.stdout);
-
-            let geo_data: GeoData =
-                serde_json::from_str(&geojson_data).expect("Failed to parse data");
-
-            for feature_collection in &geo_data.features {
-                if feature_collection.properties.layer != "mcm-2018-marathon-v1-31s1ih" {
-                    continue;
-                }
-                println!("mcm data found for tile {}, {}", x, y);
-                for feature in &feature_collection.features {
-                    let flattened_coords = feature.geometry.coordinates.flatten();
-                    if let Some(existing_coords) = unique_coords.get_mut(&feature.id) {
-                        // Add the new coordinates that don't already exist in `existing_coords`
-                        for i in (0..flattened_coords.len()).step_by(2) {
-                            let new_coord = (flattened_coords[i], flattened_coords[i + 1]);
-                            if !existing_coords
-                                .windows(2)
-                                .any(|window| window == [new_coord.0, new_coord.1])
-                            {
-                                existing_coords.push(new_coord.0);
-                                existing_coords.push(new_coord.1);
-                            }
-                        }
+            // Define a closure to handle segment processing
+            let mut process_segment = |index: usize, reversed: bool| {
+                if let Some(path) = paths.get(index) {
+                    if let Ok(segment) = write_segment(&converter, path.clone(), reversed) {
+                        track_segment.points.extend(segment);
                     } else {
-                        // The feature.id doesn't exist, so we insert it normally
-                        unique_coords.insert(feature.id, flattened_coords);
+                        eprintln!("Failed to process segment at index {}", index);
                     }
+                } else {
+                    eprintln!("Invalid path index: {}", index);
                 }
-            }
+            };
 
-            processed_tile_count += 1;
-            let divisor = total_tile_count / NOTIFY_EVERY_PERCENT as i32;
-            if processed_tile_count % (divisor) == 0 {
-                println!(
-                    "Processed {}% of the features.",
-                    10 * (processed_tile_count / divisor)
-                );
-            }
-
-            // Rate limiting
-            sleep(Duration::from_millis(100)).await;
+            process_segment(9, true);
+            process_segment(11, false);
+            process_segment(13, false);
+            process_segment(14, false);
+            process_segment(15, false);
+            process_segment(17, false);
+            process_segment(18, false);
+            process_segment(20, false);
+            process_segment(21, false);
+            process_segment(20, true);
+            process_segment(19, false);
+            process_segment(17, true);
+            process_segment(16, false);
+            process_segment(12, false);
+            process_segment(6, false);
+            process_segment(8, false);
+            process_segment(7, false);
+            process_segment(5, false);
+            process_segment(3, false);
+            process_segment(1, false);
+            process_segment(0, true);
+            process_segment(1, true);
+            process_segment(2, false);
+            process_segment(4, false);
+            process_segment(10, false);
         }
     }
+    track.segments.push(track_segment);
+    gpx.tracks.push(track);
 
-    // Write all the accumulated decoded coordinates to GPX
-    write_to_gpx(unique_coords)?;
+    let file_name = "mcm.gpx";
+    let file = File::create(file_name)?;
+    let writer = BufWriter::new(file);
+    write(&gpx, writer)?;
 
-    println!("Done!");
+    println!("Done! File written to {}", file_name);
 
     Ok(())
 }
